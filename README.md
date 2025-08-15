@@ -2,8 +2,6 @@
 
 A template for spec-driven development with automated Claude Code hooks for VSCode.
 
----
-
 ## 🚀 How It Works
 
 This template enables automated development powered by Claude Code, triggered on file changes:
@@ -61,17 +59,6 @@ npm install -g @anthropic/claude-cli
 ⚠️ Warning: Using --bypassPermissions
 
 Some hooks (like spec-driven-impl or spec-driven-bug) may use the --bypassPermissions flag to allow Claude full access to your project files.
-
-When enabled, this allows Claude to:
-• ✅ Read and write files in your workspace
-• ✅ Modify Markdown checklists and source code
-• ✅ Execute logic based on your prompt & automation rules
-
-However, Claude is strictly instructed not to:
-• ❌ Access external networks or APIs
-• ❌ Change files outside of docs/, src/, or relevant scope
-• ❌ Install packages or modify system-level configuration
-• ❌ Delete unrelated files
 
 Always review Claude’s changes using Git or version control.
 For extra safety, run in a virtualized or sandboxed environment.
