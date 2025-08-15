@@ -1,5 +1,3 @@
 # 📝 Specification
 
-## Tasks
-
 - [ ] Example task

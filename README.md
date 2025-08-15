@@ -171,7 +171,7 @@ If something goes wrong or you want to start fresh, you can reset the state of y
 ```bash
 rm docs/*
 mkdir -p docs
-echo -e "# 📝 Specification\n\n## Tasks\n\n- [ ] Example task" > docs/Spec.md
+echo -e "# 📝 Specification\n\n- [ ] Example task" > docs/Spec.md
 echo -e "# 🐞 Known Bugs\n\n- [ ] Example bug description" > docs/Bugs.md
 ```
 
