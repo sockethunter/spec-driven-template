@@ -38,7 +38,11 @@ This template enables automated development powered by Claude Code, triggered on
 - **Function**: Adds JSDoc comments to JS/TS functions
 - **Model**: `haiku`
 
----
+### 🧭 Status bar in VSCode
+
+Whenever a hook is triggered (e.g., by saving `Spec.md` or `Bugs.md`), Claude shows the current process in the **VSCode status bar**.
+
+> This lets you quickly see whether Claude is actively working or ready for the next task.
 
 ## ⚙️ Setup
 
@@ -81,8 +85,6 @@ chmod +x hooks/*
 chmod +x hooks/docgen/*
 ```
 
-⸻
-
 📁 Structure
 
 ```
@@ -103,8 +105,6 @@ chmod +x hooks/docgen/*
 │       └── jsdoc             # Adds JSDoc to JS/TS code
 └── README.md
 ```
-
-⸻
 
 ## 🔧 Configuration
 
