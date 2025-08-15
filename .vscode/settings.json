@@ -1,0 +1,29 @@
+{
+  "emeraldwalk.runonsave": {
+    "autoClearConsole": false,
+    "showElapsed": true,
+    "commands": [
+      {
+        "match": "docs/Spec.md",
+        "isAsync": true,
+        "cmd": "zsh -lc '\"${workspaceFolder}/hooks/spec-driven\" \"${file}\" \"${workspaceFolder}\"'"
+      },
+      {
+        "match": "docs/Bugs.md",
+        "isAsync": true,
+        "cmd": "zsh -lc '\"${workspaceFolder}/hooks/spec-driven-bug\" \"${file}\" \"${workspaceFolder}\"'"
+      },
+      {
+        "match": "\\*.kt$",
+        "isAsync": true,
+        "cmd": "zsh -lc '\"${workspaceFolder}/hooks/docgen/kdoc\" \"${file}\" \"${workspaceFolder}\"'"
+      },
+      {
+        "match": "\\.(cjs|mjs|js|jsx|ts|tsx)$",
+        "isAsync": true,
+        "cmd": "zsh -lc '\"${workspaceFolder}/hooks/docgen/jsdoc\" \"${file}\" \"${workspaceFolder}\"'"
+      }
+    ]
+  },
+  "window.title": "${dirty}${activeEditorShort}${separator}${rootName}${separator}"
+}

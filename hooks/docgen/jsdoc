@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FILE="${1:-}"
+ROOT="${2:-}"
+
+# ---- Configuration ----
+: "${JSDOC_MODEL:=haiku}"
+: "${JSDOC_MAX_TURNS:=10}"
+: "${JSDOC_DEBOUNCE_SECONDS:=8}"
+: "${JSDOC_MAX_LINES:=1200}"
+: "${JSDOC_CACHE_DIR:=.jsdoc-cache}"
+: "${JSDOC_TIMEOUT:=40}"
+# -----------------------------------
+
+if [[ -z "$FILE" ]]; then
+  echo "[jsdoc_claude] File not found" >&2
+  exit 2
+fi
+
+if [[ -n "$ROOT" ]]; then
+  cd "$ROOT"
+elif git rev-parse --show-toplevel >/dev/null 2>&1; then
+  cd "$(git rev-parse --show-toplevel)"
+fi
+
+mkdir -p "$JSDOC_CACHE_DIR"
+
+# Clean up old cache files (older than 30 days)
+find "$JSDOC_CACHE_DIR" -name "*" -type f -not -path "*/pids/*" -mtime +30 -delete 2>/dev/null || true
+
+LINES=$(wc -l < "$FILE" | tr -d ' ')
+if [[ "$LINES" -gt "$JSDOC_MAX_LINES" ]]; then
+  echo "[jsdoc_claude] Skip (too big: ${LINES} Lines > ${JSDOC_MAX_LINES})"
+  exit 0
+fi
+
+KEY=$(echo "$FILE" | shasum -a 256 | awk '{print $1}')
+CACHE_FILE="${JSDOC_CACHE_DIR}/${KEY}"
+CONTENT_HASH=$(shasum -a 256 "$FILE" | awk '{print $1}')
+LAST_HASH=""; LAST_TS=0
+if [[ -f "$CACHE_FILE" ]]; then
+  read -r LAST_HASH LAST_TS < "$CACHE_FILE" || true
+fi
+NOW=$(date +%s)
+if [[ "$CONTENT_HASH" == "$LAST_HASH" && $((NOW - LAST_TS)) -lt $JSDOC_DEBOUNCE_SECONDS ]]; then
+  echo "[jsdoc_claude] Skip (debounce & unchanged)"
+  exit 0
+fi
+
+# Check if we have undocumented elements or if file changed since last successful run
+if [[ "$CONTENT_HASH" == "$LAST_HASH" ]]; then
+  echo "[jsdoc_claude] Skip (file not changed since last run)"
+  exit 0
+fi
+
+echo "[jsdoc_claude] Starting Claude"
+
+CLAUDE_BIN=$(command -v claude || true)
+if [[ -z "$CLAUDE_BIN" ]]; then
+  echo "[jsdoc_claude] 'claude' not in PATH" >&2
+  exit 127
+fi
+
+PID_DIR="${JSDOC_CACHE_DIR}/pids"; mkdir -p "$PID_DIR"
+PID_FILE="${PID_DIR}/${KEY}.pid"
+
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "[jsdoc_claude] Cancel: killing running task (PID=$OLD_PID)"
+    kill -TERM "$OLD_PID" 2>/dev/null || true
+    for i in {1..20}; do
+      sleep 0.1
+      kill -0 "$OLD_PID" 2>/dev/null || break
+    done
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "[jsdoc_claude] Cancel: SIGKILL"
+      kill -KILL "$OLD_PID" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PID_FILE" || true
+fi
+
+# Status für VSCode anzeigen
+BASENAME=$(basename "$FILE")
+
+# VSCode Title Update über Settings
+update_vscode_title() {
+  local status="$1"
+  # Count actually running processes, not just pid files
+  local running_count=0
+  if [[ -d "${JSDOC_CACHE_DIR}/pids" ]]; then
+    for pid_file in "${JSDOC_CACHE_DIR}/pids"/*.pid; do
+      [[ -f "$pid_file" ]] || continue
+      local pid=$(cat "$pid_file" 2>/dev/null || true)
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        ((running_count++))
+      fi
+    done
+  fi
+  
+  local settings_file=".vscode/settings.json"
+  
+  if [[ -n "$status" ]]; then
+    local title
+    if [[ "$status" == "ready" ]]; then
+      title="JSDoc ready"
+      echo "📊 $title"
+    elif [[ "$status" == "⚡ RUNNING" ]]; then
+      title="JSDoc running ($running_count)"
+      echo "📊 $title"
+    else
+      title="JSDoc $status"
+      echo "📊 $title"
+    fi
+    
+    # VSCode Settings dynamisch anpassen
+    if [[ -f "$settings_file" ]]; then
+      # Backup original settings
+      if [[ ! -f "${settings_file}.backup" ]]; then
+        cp "$settings_file" "${settings_file}.backup"
+      fi
+      
+      # Add window.title to settings
+      local temp_file=$(mktemp)
+      jq --arg title "$title" '. + {"window.title": ("${dirty}${activeEditorShort}${separator}${rootName}${separator}" + $title)}' "${settings_file}.backup" > "$temp_file" && mv "$temp_file" "$settings_file"
+    fi
+  else
+    # Restore original settings
+    if [[ -f "${settings_file}.backup" ]]; then
+      mv "${settings_file}.backup" "$settings_file"
+    fi
+  fi
+}
+
+update_vscode_title "ready"
+echo "[jsdoc_claude] 🚀 START: $BASENAME (Modell: $JSDOC_MODEL, turns=$JSDOC_MAX_TURNS)"
+
+PROMPT=$(cat <<'EOF'
+You are a documentation generator for JavaScript code. Your ONLY task is to add or update JSDoc comments.
+
+STRICT RULES:
+- NEVER add new functions, classes, or properties
+- NEVER change existing function signatures, names, or implementations
+- NEVER change package declarations or imports
+- NEVER rewrite existing code logic
+- ONLY add /** */ JSDoc comments above functions/classes that need them
+- ONLY update existing JSDoc comments if they don't match the current function signature
+
+What you CAN do:
+- Add JSDoc comments (/** */) above functions that don't have them
+- Update JSDoc comments if function parameters/return types have changed
+- Fix typos in existing JSDoc comments
+
+What you CANNOT do:
+- Add new functions or classes
+- Change function names, parameters, or return types
+- Change any implementation code
+- Change package names
+- Add or remove imports
+- Rewrite the file structure
+
+If a function already has appropriate JSDoc that matches its signature, leave it unchanged.
+If no documentation work is needed, say "No changes needed" and make no edits.
+EOF
+)
+PROMPT="${PROMPT}
+
+Only modify the file at path: ${FILE}
+If no changes are needed, do nothing."
+
+START_TS=$(date +%s)
+echo "[jsdoc_claude] ⚡ RUN: $BASENAME ($(date '+%H:%M:%S'))"
+echo "────────────────────────────────"
+
+(
+  exec "$CLAUDE_BIN" -p \
+    --model "$JSDOC_MODEL" \
+    --permission-mode acceptEdits \
+    --allowedTools Edit Read Write MultiEdit \
+    --max-turns "$JSDOC_MAX_TURNS" \
+    <<< "$PROMPT"
+) &
+CLAUDE_PID=$!
+echo "$CLAUDE_PID" > "$PID_FILE"
+
+# Update status after PID is saved
+update_vscode_title "⚡ RUNNING"
+
+(
+  sleep "$JSDOC_TIMEOUT"
+  if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    echo "[jsdoc_claude] TIMEOUT (${JSDOC_TIMEOUT}s) → SIGTERM"
+    kill -TERM "$CLAUDE_PID" 2>/dev/null || true
+  fi
+  sleep 2
+  if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    echo "[jsdoc_claude] TIMEOUT escalate → SIGKILL"
+    kill -KILL "$CLAUDE_PID" 2>/dev/null || true
+  fi
+) & WATCHDOG_PID=$!
+
+wait "$CLAUDE_PID"
+STATUS=$?
+
+kill "$WATCHDOG_PID" 2>/dev/null || true
+rm -f "$PID_FILE" || true
+
+echo "────────────────────────────────"
+END_TS=$(date +%s)
+DUR=$((END_TS - START_TS))
+
+if [[ $STATUS -eq 0 ]]; then
+  NEW_HASH=$(shasum -a 256 "$FILE" | awk '{print $1}')
+  echo "$NEW_HASH $NOW" > "$CACHE_FILE"
+  update_vscode_title "✅ DONE"
+  echo "[jsdoc_claude] ✅ DONE: $BASENAME (${DUR}s)"
+  sleep 1
+  update_vscode_title ""  # Back to normal
+else
+  update_vscode_title "❌ ERROR"
+  echo "[jsdoc_claude] ❌ ERROR: $BASENAME (Exit $STATUS, ${DUR}s)"
+  sleep 2
+  update_vscode_title ""  # Back to normal
+  exit $STATUS
+fi

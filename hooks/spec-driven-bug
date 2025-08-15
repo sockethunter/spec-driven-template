@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FILE="${1:-}"
+ROOT="${2:-}"
+
+# ---- Configuration ----
+: "${SETTING_MODEL:=sonnet}"
+: "${SETTING_DEBOUNCE_SECONDS:=8}"
+: "${SETTING_MAX_LINES:=1200}"
+: "${SETTING_CACHE_DIR:=.hook-cache}"
+: "${SETTING_TIMEOUT:=300}"
+: "${SETTING_PREFIX:=spec-driven-bug}"
+# -----------------------------------
+
+if [[ -z "$FILE" ]]; then
+  echo "[$SETTING_PREFIX] File not found" >&2
+  exit 2
+fi
+
+if [[ -f "hooks/spec-driven-impl-running" ]]; then
+  echo "[$SETTING_PREFIX] Implementation is running, please wait for it to finish!" >&2
+  exit 0
+fi
+
+if [[ -n "$ROOT" ]]; then
+  cd "$ROOT"
+elif git rev-parse --show-toplevel >/dev/null 2>&1; then
+  cd "$(git rev-parse --show-toplevel)"
+fi
+
+mkdir -p "$SETTING_CACHE_DIR"
+
+# Clean up old cache files (older than 30 days)
+find "$SETTING_CACHE_DIR" -name "*" -type f -not -path "*/pids/*" -mtime +30 -delete 2>/dev/null || true
+
+LINES=$(wc -l < "$FILE" | tr -d ' ')
+if [[ "$LINES" -gt "$SETTING_MAX_LINES" ]]; then
+  echo "[$SETTING_PREFIX] Skip (too big: ${LINES} Lines > ${SETTING_MAX_LINES})"
+  exit 0
+fi
+
+KEY=$(echo "$FILE" | shasum -a 256 | awk '{print $1}')
+CACHE_FILE="${SETTING_CACHE_DIR}/${KEY}"
+CONTENT_HASH=$(shasum -a 256 "$FILE" | awk '{print $1}')
+LAST_HASH=""; LAST_TS=0
+if [[ -f "$CACHE_FILE" ]]; then
+  read -r LAST_HASH LAST_TS < "$CACHE_FILE" || true
+fi
+NOW=$(date +%s)
+if [[ "$CONTENT_HASH" == "$LAST_HASH" && $((NOW - LAST_TS)) -lt $SETTING_DEBOUNCE_SECONDS ]]; then
+  echo "[$SETTING_PREFIX] Skip (debounce & unchanged)"
+  exit 0
+fi
+
+# Check if we have undocumented elements or if file changed since last successful run
+if [[ "$CONTENT_HASH" == "$LAST_HASH" ]]; then
+  echo "[$SETTING_PREFIX] Skip (file not changed since last run)"
+  exit 0
+fi
+
+echo "[$SETTING_PREFIX] Starting Claude"
+
+CLAUDE_BIN=$(command -v claude || true)
+if [[ -z "$CLAUDE_BIN" ]]; then
+  echo "[$SETTING_PREFIX] 'claude' not in PATH" >&2
+  exit 127
+fi
+
+# Status für VSCode anzeigen
+BASENAME=$(basename "$FILE")
+
+# VSCode Title Update über Settings
+update_vscode_title() {
+  local status="$1"
+  
+  local settings_file=".vscode/settings.json"
+  
+  if [[ -n "$status" ]]; then
+    local title
+    if [[ "$status" == "ready" ]]; then
+      title="Spec-driven ready"
+      echo "📊 $title"
+    elif [[ "$status" == "⚡ RUNNING" ]]; then
+      title="Spec-driven running"
+      echo "📊 $title"
+    else
+      title="Spec-driven $status"
+      echo "📊 $title"
+    fi
+    
+    # VSCode Settings dynamisch anpassen
+    if [[ -f "$settings_file" ]]; then
+      # Backup original settings
+      if [[ ! -f "${settings_file}.backup" ]]; then
+        cp "$settings_file" "${settings_file}.backup"
+      fi
+      
+      # Add window.title to settings
+      local temp_file=$(mktemp)
+      jq --arg title "$title" '. + {"window.title": ("${dirty}${activeEditorShort}${separator}${rootName}${separator}" + $title)}' "${settings_file}.backup" > "$temp_file" && mv "$temp_file" "$settings_file"
+    fi
+  else
+    # Restore original settings
+    if [[ -f "${settings_file}.backup" ]]; then
+      mv "${settings_file}.backup" "$settings_file"
+    fi
+  fi
+}
+
+update_vscode_title "ready"
+echo "[$SETTING_PREFIX] 🚀 START: $BASENAME (Modell: $SETTING_MODEL)"
+
+PROMPT=$(cat <<'EOF'
+🐞 Prompt for Claude (Fix Bugs from Markdown + Check Off):
+
+You will soon receive a Markdown file with a list of bugs in the following format:
+
+## Bugs
+- [ ] Bug description 1  
+- [ ] Bug description 2  
+
+🔧 Your Task:
+	1.	Go through the list from top to bottom.
+	2.	Analyze and fix each bug individually – write the necessary code, show the fix, or clearly explain what needs to be done.
+	3.	After fixing a bug, mark it as completed by replacing [ ] with [x].
+	4.	Add a short note directly below the bug, for example:
+• [x] Button does not respond on mobile  _(✅ fixed: Event listener was not registered correctly)_
+• Or: Code example inserted…
+	5.	If a bug is unclear or needs to be reproduced, describe your assumptions or the tests you performed.
+
+📘 Goal: At the end, return an updated Markdown file with:
+• Checked-off bugs
+• Your notes on the cause or solution
+• Optional code examples where helpful
+EOF
+)
+PROMPT="${PROMPT}
+
+The Markdown file is located here: ${FILE}"
+
+START_TS=$(date +%s)
+echo "[$SETTING_PREFIX] ⚡ RUN: $BASENAME ($(date '+%H:%M:%S'))"
+echo "────────────────────────────────"
+
+(
+  exec "$CLAUDE_BIN" -p \
+    --model "$SETTING_MODEL" \
+    --permission-mode bypassPermissions \
+    --allowedTools Edit Read Write MultiEdit \
+    <<< "$PROMPT"
+) &
+CLAUDE_PID=$!
+
+# Update status after PID is saved
+update_vscode_title "⚡ RUNNING"
+
+(
+  sleep "$SETTING_TIMEOUT"
+  if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    echo "[$SETTING_PREFIX] TIMEOUT (${SETTING_TIMEOUT}s) → SIGTERM"
+    kill -TERM "$CLAUDE_PID" 2>/dev/null || true
+  fi
+  sleep 2
+  if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    echo "[$SETTING_PREFIX] TIMEOUT escalate → SIGKILL"
+    kill -KILL "$CLAUDE_PID" 2>/dev/null || true
+  fi
+) & WATCHDOG_PID=$!
+
+wait "$CLAUDE_PID"
+STATUS=$?
+
+kill "$WATCHDOG_PID" 2>/dev/null || true
+
+echo "────────────────────────────────"
+END_TS=$(date +%s)
+DUR=$((END_TS - START_TS))
+
+if [[ $STATUS -eq 0 ]]; then
+  NEW_HASH=$(shasum -a 256 "$FILE" | awk '{print $1}')
+  echo "$NEW_HASH $NOW" > "$CACHE_FILE"
+  update_vscode_title "✅ DONE"
+  echo "[$SETTING_PREFIX] ✅ DONE: $BASENAME (${DUR}s)"
+  sleep 1
+  update_vscode_title ""  # Back to normal
+else
+  update_vscode_title "❌ ERROR"
+  echo "[$SETTING_PREFIX] ❌ ERROR: $BASENAME (Exit $STATUS, ${DUR}s)"
+  sleep 2
+  update_vscode_title ""  # Back to normal
+  exit $STATUS
+fi

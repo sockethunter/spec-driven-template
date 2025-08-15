@@ -1,0 +1,9 @@
+# Caches
+
+.hook-cache/
+.kdoc-cache/
+.jsdoc-cache/
+
+# Docs
+
+docs/Tasks.md
